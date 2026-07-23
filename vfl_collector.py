@@ -15,8 +15,9 @@ Run:
   DATABASE_URL=postgresql://... python3 vfl_collector.py
 """
 
-import os, json, time, threading, requests, psycopg2
+import os, json, time, threading, requests
 from datetime import datetime
+import psycopg2
 from psycopg2.extras import execute_values
 
 DATABASE_URL           = os.environ.get('DATABASE_URL', '')
