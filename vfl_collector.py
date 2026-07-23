@@ -26,11 +26,15 @@ POLL_BETKRAFT_SECONDS  = 5
 
 # ── DB ─────────────────────────────────────────────────────────────────
 def get_db():
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    # Railway Postgres requires SSL — append sslmode if not present
+    url = DATABASE_URL
+    if url and 'sslmode' not in url:
+        url += ('&' if '?' in url else '?') + 'sslmode=require'
+    return psycopg2.connect(url, connect_timeout=15)
 
 
 def init_schema():
-    ddl = [
+    stmts = [
         """CREATE TABLE IF NOT EXISTS betpawa_rounds (
             id           SERIAL PRIMARY KEY,
             round_id     TEXT NOT NULL,
@@ -76,12 +80,16 @@ def init_schema():
         "CREATE INDEX IF NOT EXISTS bk_pair_idx  ON betkraft_rounds(home, away)",
         "CREATE INDEX IF NOT EXISTS bk_round_idx ON betkraft_rounds(round_id)",
     ]
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            for stmt in ddl:
-                cur.execute(stmt)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        for stmt in stmts:
+            cur.execute(stmt)
         conn.commit()
-    print("[init] Schema ready", flush=True)
+        cur.close()
+        print("[init] Schema ready", flush=True)
+    finally:
+        conn.close()
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────
@@ -171,22 +179,26 @@ def bp_markets(event):
 def bp_save(records):
     if not records:
         return
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, """
-                INSERT INTO betpawa_rounds
-                  (round_id, league, league_id, home, away,
-                   ft_h, ft_a, ht_h, ht_a, htft_outcome,
-                   odds_1, odds_x, odds_2,
-                   ou_15_over, ou_15_under, ou_25_over, ou_25_under,
-                   ou_35_over, ou_35_under, btts_yes, btts_no,
-                   htft_11, htft_1x, htft_12,
-                   htft_x1, htft_xx, htft_x2,
-                   htft_21, htft_2x, htft_22)
-                VALUES %s
-                ON CONFLICT (round_id, league_id, home, away) DO NOTHING
-            """, records)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        execute_values(cur, """
+            INSERT INTO betpawa_rounds
+              (round_id, league, league_id, home, away,
+               ft_h, ft_a, ht_h, ht_a, htft_outcome,
+               odds_1, odds_x, odds_2,
+               ou_15_over, ou_15_under, ou_25_over, ou_25_under,
+               ou_35_over, ou_35_under, btts_yes, btts_no,
+               htft_11, htft_1x, htft_12,
+               htft_x1, htft_xx, htft_x2,
+               htft_21, htft_2x, htft_22)
+            VALUES %s
+            ON CONFLICT (round_id, league_id, home, away) DO NOTHING
+        """, records)
         conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
 def bp_collect():
@@ -304,18 +316,22 @@ def bk_parse_score(score_str):
 def bk_save(records):
     if not records:
         return
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, """
-                INSERT INTO betkraft_rounds
-                  (round_id, match_n, home, away,
-                   ft_h, ft_a, ht_h, ht_a,
-                   markets, odds_1, odds_x, odds_2,
-                   ou_25_over, ou_25_under, btts_yes)
-                VALUES %s
-                ON CONFLICT (round_id, home, away) DO NOTHING
-            """, records)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        execute_values(cur, """
+            INSERT INTO betkraft_rounds
+              (round_id, match_n, home, away,
+               ft_h, ft_a, ht_h, ht_a,
+               markets, odds_1, odds_x, odds_2,
+               ou_25_over, ou_25_under, btts_yes)
+            VALUES %s
+            ON CONFLICT (round_id, home, away) DO NOTHING
+        """, records)
         conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
 def bk_collect():
