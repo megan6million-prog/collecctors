@@ -17,8 +17,8 @@ Run:
 
 import os, json, time, threading, requests
 from datetime import datetime
-import psycopg2
-from psycopg2.extras import execute_values
+import pg8000
+from urllib.parse import urlparse
 
 DATABASE_URL           = os.environ.get('DATABASE_URL', '')
 POLL_BETPAWA_SECONDS   = 4
@@ -27,11 +27,31 @@ POLL_BETKRAFT_SECONDS  = 5
 
 # ── DB ─────────────────────────────────────────────────────────────────
 def get_db():
-    # Railway Postgres requires SSL — append sslmode if not present
-    url = DATABASE_URL
-    if url and 'sslmode' not in url:
-        url += ('&' if '?' in url else '?') + 'sslmode=require'
-    return psycopg2.connect(url, connect_timeout=15)
+    u = urlparse(DATABASE_URL)
+    return pg8000.connect(
+        host=u.hostname,
+        port=u.port or 5432,
+        database=u.path.lstrip('/'),
+        user=u.username,
+        password=u.password,
+        ssl_context=True,       # Railway requires SSL
+        timeout=15,
+    )
+
+def execute_values(conn, sql, rows):
+    """pg8000 compatible bulk insert."""
+    if not rows:
+        return
+    # Build parameterised placeholders
+    n_cols  = len(rows[0])
+    ph      = '(' + ','.join(['%s'] * n_cols) + ')'
+    all_ph  = ','.join([ph] * len(rows))
+    flat    = [v for row in rows for v in row]
+    # Strip the VALUES %s from INSERT and append our placeholders
+    full_sql = sql.replace('VALUES %s', f'VALUES {all_ph}')
+    cur = conn.cursor()
+    cur.execute(full_sql, flat)
+    conn.commit()
 
 
 def init_schema():
@@ -69,7 +89,7 @@ def init_schema():
             ft_a         INT,
             ht_h         INT,
             ht_a         INT,
-            markets      JSONB,
+            markets      TEXT,
             odds_1       FLOAT, odds_x FLOAT, odds_2 FLOAT,
             ou_25_over   FLOAT, ou_25_under FLOAT,
             btts_yes     FLOAT,
@@ -182,8 +202,7 @@ def bp_save(records):
         return
     conn = get_db()
     try:
-        cur = conn.cursor()
-        execute_values(cur, """
+        execute_values(conn, """
             INSERT INTO betpawa_rounds
               (round_id, league, league_id, home, away,
                ft_h, ft_a, ht_h, ht_a, htft_outcome,
@@ -196,8 +215,6 @@ def bp_save(records):
             VALUES %s
             ON CONFLICT (round_id, league_id, home, away) DO NOTHING
         """, records)
-        conn.commit()
-        cur.close()
     finally:
         conn.close()
 
@@ -319,8 +336,7 @@ def bk_save(records):
         return
     conn = get_db()
     try:
-        cur = conn.cursor()
-        execute_values(cur, """
+        execute_values(conn, """
             INSERT INTO betkraft_rounds
               (round_id, match_n, home, away,
                ft_h, ft_a, ht_h, ht_a,
@@ -329,8 +345,6 @@ def bk_save(records):
             VALUES %s
             ON CONFLICT (round_id, home, away) DO NOTHING
         """, records)
-        conn.commit()
-        cur.close()
     finally:
         conn.close()
 
