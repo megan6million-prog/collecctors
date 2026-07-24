@@ -2,28 +2,20 @@
 """
 vfl_collector.py — Clean VFL data collector
 ============================================
-Collects betpawa + betkraft results + odds and saves to Postgres.
-
-Odds strategy:
-  - Betpawa: dedicated 2s poller grabs odds during pre-match window
-  - Betkraft: dedicated poller grabs odds via /data before round starts
-  - Results saved once FT score confirmed
-
-Run:
-  DATABASE_URL=postgresql://... python3 vfl_collector.py
+Rate-limited design:
+  - Only fetches ACTIVE round (within tradingTime window) for odds
+  - Only fetches LATEST completed round for results
+  - Betkraft: /results/1/0 already batches all recent rounds
+  - Max ~10 API calls per minute per platform
 """
 
 import os, json, time, threading, requests
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import pg8000
 from urllib.parse import urlparse
 
-DATABASE_URL          = os.environ.get('DATABASE_URL', '')
-POLL_BP_ODDS_SECS     = 2   # fast — catch the 5-min betpawa window
-POLL_BP_RESULTS_SECS  = 5
-POLL_BK_ODDS_SECS     = 3   # fast — catch betkraft pre-match
-POLL_BK_RESULTS_SECS  = 6
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 
 # ── DB ─────────────────────────────────────────────────────────────────
@@ -98,8 +90,8 @@ def init_schema():
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────
-def fetch(url, headers, payload=None, timeout=10):
-    for i in range(4):
+def fetch(url, headers, payload=None, timeout=12):
+    for i in range(3):
         try:
             if payload is not None:
                 r = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -107,9 +99,13 @@ def fetch(url, headers, payload=None, timeout=10):
                 r = requests.get(url, headers=headers, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
+            # Back off on 429 rate limit
+            if r.status_code == 429:
+                print(f"[ratelimit] {url[:60]} — sleeping 10s", flush=True)
+                time.sleep(10)
         except Exception:
             pass
-        time.sleep(1 + i)
+        time.sleep(2 + i * 2)
     return None
 
 
@@ -183,88 +179,104 @@ def bp_save(records):
         """, records)
     finally: conn.close()
 
+def bp_get_active_rounds(seasons):
+    """Return only rounds currently in their trading window + last completed."""
+    now = datetime.now(timezone.utc)
+    active = []; recent_done = []
+    for season in seasons:
+        for rnd in season.get('rounds',[]):
+            t  = rnd.get('tradingTime',{})
+            t0 = t.get('start',''); t1 = t.get('end','')
+            try:
+                start = datetime.fromisoformat(t0.replace('Z','+00:00'))
+                end   = datetime.fromisoformat(t1.replace('Z','+00:00'))
+                if start <= now <= end:
+                    active.append(rnd['id'])       # betting window open
+                elif end < now:
+                    recent_done.append((end, rnd['id']))  # finished
+            except Exception:
+                pass
+    # Only keep last 5 completed rounds (avoid re-scanning old history)
+    recent_done.sort(key=lambda x: x[0], reverse=True)
+    return active, [r for _,r in recent_done[:5]]
+
 def bp_collect():
     seen=set(); mkt_cache={}; saved=0
+    print("[betpawa] Collector started", flush=True)
 
-    # ── Fast odds poller (every 2s) ────────────────────────────────
-    def odds_poller():
-        print("[betpawa/odds] Poller started (2s)", flush=True)
-        while True:
-            try:
-                data = fetch(BP_SEASONS, BP_H)
-                if not data: time.sleep(2); continue
-                for season in data.get('items',[]):
-                    for rnd in season.get('rounds',[]):
-                        ed = fetch(BP_EVENTS.format(round_id=rnd['id']), BP_H)
-                        if not ed: continue
-                        for e in ed.get('responses',[]):
-                            mkts = bp_markets(e)
-                            if mkts['1x2'] or mkts['htft']:
-                                mkt_cache[e['id']] = mkts
-                                print(f"[betpawa/odds] cached rnd={rnd['id']} eid={e['id']} 1x2={mkts['1x2']}", flush=True)
-            except Exception as ex:
-                print(f"[betpawa/odds] {ex}", flush=True)
-            time.sleep(POLL_BP_ODDS_SECS)
-
-    threading.Thread(target=odds_poller, name='bp_odds', daemon=True).start()
-
-    # ── Results poller (every 5s) ──────────────────────────────────
-    print("[betpawa] Results poller started", flush=True)
     while True:
         try:
             data = fetch(BP_SEASONS, BP_H)
-            if not data: time.sleep(POLL_BP_RESULTS_SECS); continue
-            for season in data.get('items',[]):
-                for rnd in season.get('rounds',[]):
-                    round_id = rnd['id']
-                    ed = fetch(BP_EVENTS.format(round_id=round_id), BP_H)
-                    if not ed: continue
-                    records=[]
-                    for e in ed.get('responses',[]):
-                        eid=e['id']
-                        name=e.get('name','')
-                        if ' - ' not in name: continue
-                        home,away=[x.strip() for x in name.split(' - ',1)]
-                        comp=e.get('competition',{}); lid=str(comp.get('id',''))
-                        lname=BP_LEAGUES.get(lid,comp.get('name',''))
-                        if not lname: continue
-                        # Also cache if odds present
+            if not data: time.sleep(5); continue
+
+            seasons = data.get('items',[])
+            active_rounds, recent_rounds = bp_get_active_rounds(seasons)
+            rounds_to_fetch = list(set(active_rounds + recent_rounds))
+
+            print(f"[betpawa] active={len(active_rounds)} recent={len(recent_rounds)} fetching={len(rounds_to_fetch)}", flush=True)
+
+            for round_id in rounds_to_fetch:
+                ed = fetch(BP_EVENTS.format(round_id=round_id), BP_H)
+                if not ed: continue
+                time.sleep(0.5)  # gentle between round fetches
+
+                records=[]
+                for e in ed.get('responses',[]):
+                    eid=e['id']
+                    name=e.get('name','')
+                    if ' - ' not in name: continue
+                    home,away=[x.strip() for x in name.split(' - ',1)]
+                    comp=e.get('competition',{}); lid=str(comp.get('id',''))
+                    lname=BP_LEAGUES.get(lid,comp.get('name',''))
+                    if not lname: continue
+
+                    # Cache odds if in active window
+                    if round_id in active_rounds:
                         mkts=bp_markets(e)
                         if mkts['1x2'] or mkts['htft']:
                             mkt_cache[eid]=mkts
-                        key=(round_id,lid,home,away)
-                        if key in seen: continue
-                        ppr=e.get('results',{}).get('participantPeriodResults',[])
-                        if not ppr: continue
-                        hth,hta,fth,fta=bp_scores(ppr)
-                        if fth is None: continue
-                        seen.add(key)
-                        m=mkt_cache.get(eid,mkts)
-                        x12=m.get('1x2',{}); ou=m.get('ou',[]); btts=m.get('btts',{}); htft=m.get('htft',{})
-                        outcome=bp_htft(hth,hta,fth,fta)
-                        records.append((
-                            round_id,lname,lid,home,away,
-                            fth,fta,hth,hta,outcome,
-                            x12.get('1'),x12.get('X'),x12.get('2'),
-                            ou[0].get('over')  if len(ou)>0 else None,
-                            ou[0].get('under') if len(ou)>0 else None,
-                            ou[1].get('over')  if len(ou)>1 else None,
-                            ou[1].get('under') if len(ou)>1 else None,
-                            ou[2].get('over')  if len(ou)>2 else None,
-                            ou[2].get('under') if len(ou)>2 else None,
-                            btts.get('yes'),btts.get('no'),
-                            htft.get('1/1'),htft.get('1/X'),htft.get('1/2'),
-                            htft.get('X/1'),htft.get('X/X'),htft.get('X/2'),
-                            htft.get('2/1'),htft.get('2/X'),htft.get('2/2'),
-                        ))
-                        has_odds = '✓' if x12.get('1') else '✗'
-                        print(f"[betpawa] [{lname}] {home} v {away} HT={hth}:{hta} FT={fth}:{fta} HTFT={outcome} odds={has_odds}", flush=True)
-                    if records:
-                        bp_save(records); saved+=len(records)
-                        print(f"[betpawa] +{len(records)} saved (total {saved})", flush=True)
+
+                    key=(round_id,lid,home,away)
+                    if key in seen: continue
+
+                    ppr=e.get('results',{}).get('participantPeriodResults',[])
+                    if not ppr: continue
+                    hth,hta,fth,fta=bp_scores(ppr)
+                    if fth is None: continue
+
+                    # Validate FT score — must be >= HT score for each team
+                    if hth is not None and (fth < hth or fta < hta): continue
+
+                    seen.add(key)
+                    m=mkt_cache.get(eid,{})
+                    x12=m.get('1x2',{}); ou=m.get('ou',[]); btts=m.get('btts',{}); htft=m.get('htft',{})
+                    outcome=bp_htft(hth,hta,fth,fta)
+                    has_odds='✓' if x12.get('1') else '✗'
+                    records.append((
+                        round_id,lname,lid,home,away,
+                        fth,fta,hth,hta,outcome,
+                        x12.get('1'),x12.get('X'),x12.get('2'),
+                        ou[0].get('over')  if len(ou)>0 else None,
+                        ou[0].get('under') if len(ou)>0 else None,
+                        ou[1].get('over')  if len(ou)>1 else None,
+                        ou[1].get('under') if len(ou)>1 else None,
+                        ou[2].get('over')  if len(ou)>2 else None,
+                        ou[2].get('under') if len(ou)>2 else None,
+                        btts.get('yes'),btts.get('no'),
+                        htft.get('1/1'),htft.get('1/X'),htft.get('1/2'),
+                        htft.get('X/1'),htft.get('X/X'),htft.get('X/2'),
+                        htft.get('2/1'),htft.get('2/X'),htft.get('2/2'),
+                    ))
+                    print(f"[betpawa] [{lname}] {home} v {away} HT={hth}:{hta} FT={fth}:{fta} HTFT={outcome} odds={has_odds}", flush=True)
+
+                if records:
+                    bp_save(records); saved+=len(records)
+                    print(f"[betpawa] +{len(records)} saved (total {saved})", flush=True)
+
         except Exception as e:
             print(f"[betpawa] Error: {e}", flush=True)
-        time.sleep(POLL_BP_RESULTS_SECS)
+
+        time.sleep(8)  # wait 8s before next full cycle (~12 req/min max)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -286,29 +298,27 @@ BK_ALL_MARKETS = ['1X2','GG','TG15','TG25','DC','TG35','H1X2','DCH','HS',
                   '1X2G','1X2OU15','1X2OU25','1X2OU35','CS','DR','TG','TGOE',
                   'MG','FTS','TFG','T1G','T2G','HGG']
 
-def bk_fetch_odds(rn_id):
-    """Fetch all 23 markets for a round, merge into per-match dict."""
+def bk_fetch_round_odds(rn_id):
+    """Fetch all markets for one round — sequential with delay to avoid rate limits."""
     match_odds = {}
-    def _fetch(mkt):
+    for mkt in BK_ALL_MARKETS:
         d = fetch(BK_DATA, BK_H, payload={
             'round_number_id': rn_id, 'competition_id': 1,
             'country_id': None, 'market_id': mkt
         })
-        if not d: return
-        for m in d.get('data',{}).get('matches',[]):
-            eid = m['event_id']
-            if eid not in match_odds:
-                match_odds[eid] = {'home': m['home'], 'away': m['away'], 'markets': []}
-            for mk in m.get('markets',[]):
-                if mk.get('market_id') == mkt:
-                    match_odds[eid]['markets'].append(mk)
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        list(ex.map(_fetch, BK_ALL_MARKETS))
+        if d:
+            for m in d.get('data',{}).get('matches',[]):
+                eid = m['event_id']
+                if eid not in match_odds:
+                    match_odds[eid] = {'home':m['home'],'away':m['away'],'markets':{}}
+                for mk in m.get('markets',[]):
+                    if mk.get('market_id') == mkt:
+                        match_odds[eid]['markets'][mkt] = mk
+        time.sleep(0.3)  # 0.3s between market fetches = ~7s for all 23 markets
     return match_odds
 
 def bk_parse_score(s):
-    try: parts=s.split(':'); return int(parts[0]),int(parts[1])
+    try: p=s.split(':'); return int(p[0]),int(p[1])
     except: return None,None
 
 def bk_save(records):
@@ -326,76 +336,85 @@ def bk_save(records):
 
 def bk_collect():
     seen=set(); odds_cache={}; saved=0
+    print("[betkraft] Collector started", flush=True)
 
-    # ── Fast odds poller ───────────────────────────────────────────
-    def odds_poller():
-        print("[betkraft/odds] Poller started (3s)", flush=True)
-        while True:
-            try:
-                pdata = fetch(BK_PERIODS, BK_H)
-                if not pdata: time.sleep(3); continue
-                periods = pdata.get('data',{}).get('periods',[])
-                # Poll last 3 periods (upcoming)
-                for period in periods[-3:]:
-                    rn_id = period.get('round_number_id')
-                    if not rn_id: continue
-                    match_odds = bk_fetch_odds(rn_id)
-                    if match_odds:
-                        odds_cache[rn_id] = match_odds
-                        print(f"[betkraft/odds] cached rn={rn_id} matches={len(match_odds)}", flush=True)
-            except Exception as ex:
-                print(f"[betkraft/odds] {ex}", flush=True)
-            time.sleep(POLL_BK_ODDS_SECS)
+    # Track which round_number_id we've cached odds for
+    cached_rn_ids = set()
 
-    threading.Thread(target=odds_poller, name='bk_odds', daemon=True).start()
-
-    # ── Results poller ─────────────────────────────────────────────
-    print("[betkraft] Results poller started", flush=True)
     while True:
         try:
+            # 1. Grab odds for upcoming period (before it starts)
+            pdata = fetch(BK_PERIODS, BK_H)
+            if pdata:
+                periods = pdata.get('data',{}).get('periods',[])
+                # Only cache latest 2 upcoming periods
+                for period in periods[-2:]:
+                    rn_id = period.get('round_number_id')
+                    if rn_id and rn_id not in cached_rn_ids:
+                        print(f"[betkraft/odds] Fetching odds for rn={rn_id}...", flush=True)
+                        match_odds = bk_fetch_round_odds(rn_id)
+                        if match_odds:
+                            odds_cache[rn_id] = match_odds
+                            cached_rn_ids.add(rn_id)
+                            print(f"[betkraft/odds] Cached {len(match_odds)} matches for rn={rn_id}", flush=True)
+                        # Trim cache — keep only last 10
+                        if len(cached_rn_ids) > 10:
+                            oldest = sorted(cached_rn_ids)[0]
+                            cached_rn_ids.discard(oldest)
+                            odds_cache.pop(oldest, None)
+
+            # 2. Fetch results
             rdata = fetch(BK_RESULTS, BK_H)
-            if not rdata: time.sleep(POLL_BK_RESULTS_SECS); continue
+            if not rdata: time.sleep(10); continue
+
             rounds = rdata.get('data',{}).get('results',[])
             records=[]
             for rnd in rounds:
                 round_id = str(rnd.get('round_id',''))
+                rn_id    = rnd.get('round_number_id')
                 if not round_id: continue
-                # Try to get odds for this round from cache
-                # round_id != round_number_id — map via season_id or just store what we have
-                cached_odds = odds_cache.get(round_id, {})
+                # Try to find matching odds cache
+                cached = odds_cache.get(rn_id, {})
+
                 for i,m in enumerate(rnd.get('matches',[])):
-                    home=(m.get('home') or m.get('home_team') or '').strip()
-                    away=(m.get('away') or m.get('away_team') or '').strip()
+                    home=(m.get('home') or '').strip()
+                    away=(m.get('away') or '').strip()
                     if not home or not away: continue
                     fth,fta=bk_parse_score(m.get('result',''))
                     if fth is None: continue
                     key=(round_id,home,away)
                     if key in seen: continue
                     seen.add(key)
+
                     hth,hta=bk_parse_score(m.get('half_time_scores',''))
-                    # Find odds from cache by team name
-                    match_odd = next((v for v in cached_odds.values()
+                    # Find odds by team name in cache
+                    match_odd = next((v for v in cached.values()
                                       if v.get('home')==home and v.get('away')==away), {})
-                    mkts = match_odd.get('markets',[])
-                    mkts_dict = {mk['market_id']: mk for mk in mkts}
-                    x12  = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('1X2',{}).get('outcomes',[])}
-                    ou25 = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('TG25',{}).get('outcomes',[])}
-                    btts = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('GG',{}).get('outcomes',[])}
-                    has_odds = '✓' if x12 else '✗'
+                    mkts_dict = match_odd.get('markets',{})
+                    x12  = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('1X2',{}).get('outcomes',[])} if '1X2' in mkts_dict else {}
+                    ou25 = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('TG25',{}).get('outcomes',[])} if 'TG25' in mkts_dict else {}
+                    btts = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('GG',{}).get('outcomes',[])} if 'GG' in mkts_dict else {}
+                    # Store all markets as JSON
+                    all_mkts = [{'id':k,'outcomes':v.get('outcomes',[])} for k,v in mkts_dict.items()]
+
+                    has_odds='✓' if x12 else '✗'
                     records.append((
                         round_id,i+1,home,away,fth,fta,hth,hta,
-                        json.dumps([{'market_id':mk['market_id'],'outcomes':mk.get('outcomes',[])} for mk in mkts]),
+                        json.dumps(all_mkts),
                         x12.get('1'),x12.get('X'),x12.get('2'),
                         ou25.get('O'),ou25.get('U'),
                         btts.get('Y'),
                     ))
                     print(f"[betkraft] rnd={round_id} {home} v {away} HT={hth}:{hta} FT={fth}:{fta} odds={has_odds}", flush=True)
+
             if records:
                 bk_save(records); saved+=len(records)
                 print(f"[betkraft] +{len(records)} saved (total {saved})", flush=True)
+
         except Exception as e:
             print(f"[betkraft] Error: {e}", flush=True)
-        time.sleep(POLL_BK_RESULTS_SECS)
+
+        time.sleep(10)  # 10s between result checks
 
 
 # ══════════════════════════════════════════════════════════════════════
