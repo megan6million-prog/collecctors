@@ -243,32 +243,62 @@ async def run():
         )
         page = await browser.new_page()
 
+        # ── Step 1: Test API first ──────────────────────────────────
+        log.info("Testing betpawa API...")
+        matches = get_upcoming_english_matches()
+        log.info(f"API returned {len(matches)} upcoming matches")
+        for m in matches[:5]:
+            log.info(f"  {m['home']} v {m['away']} (round={m['round_id']})")
+            key = f"{m['home']} v {m['away']}"
+            in_matrix = key in HTFT_MATRIX
+            log.info(f"    → in matrix: {in_matrix} | signals: {len(HTFT_MATRIX.get(key,[]))}")
+
+        # ── Step 2: Test login ──────────────────────────────────────
+        log.info("Testing login...")
         if not await login(page):
+            log.error("LOGIN FAILED — check BP_PHONE and BP_PIN env vars")
+            await page.screenshot(path='/tmp/login_fail.png')
+            log.info("Screenshot saved: /tmp/login_fail.png")
             await browser.close()
             return
+        log.info("Login OK")
+
+        # ── Step 3: Test page navigation ───────────────────────────
+        log.info("Testing virtuals page...")
+        await page.goto(
+            'https://www.betpawa.ug/virtual-sports?virtualTab=upcoming&leagueId=7794',
+            timeout=30000
+        )
+        await asyncio.sleep(8)
+        await page.screenshot(path='/tmp/virtuals_page.png')
+        body = await page.inner_text('body')
+        log.info(f"Page body snippet: {body[:300]}")
+
+        # Check what text is on the page
+        log.info("Checking for match text on page...")
+        if matches:
+            for m in matches[:3]:
+                txt = f"{m['home']} - {m['away']}"
+                found = txt in body
+                log.info(f"  '{txt}' in page: {found}")
 
         last_round_id = None
         bets_placed   = 0
 
         while True:
             try:
-                # Get upcoming matches via API (not scraping)
                 matches = get_upcoming_english_matches()
-                log.info(f"Upcoming English League matches: {len(matches)}")
+                log.info(f"Upcoming: {len(matches)} matches")
 
                 if not matches:
-                    log.info("No upcoming matches — waiting 60s")
-                    await asyncio.sleep(60)
-                    continue
+                    await asyncio.sleep(60); continue
 
                 round_id = matches[0]['round_id']
                 if round_id == last_round_id:
-                    log.info(f"Same round {round_id} — waiting for next")
-                    await asyncio.sleep(60)
-                    continue
+                    await asyncio.sleep(60); continue
 
                 last_round_id = round_id
-                log.info(f"New round: {round_id} | {len(matches)} matches")
+                log.info(f"New round: {round_id}")
 
                 bets_this_round = 0
                 for m in matches:
@@ -277,27 +307,22 @@ async def run():
                     if key not in HTFT_MATRIX:
                         continue
                     signals = HTFT_MATRIX[key]
-                    log.info(f"  {key} → {len(signals)} bets")
+                    log.info(f"  BETTING: {key} → {len(signals)} markets")
                     for market, odds, p_win, ev in signals:
                         log_bet(home, away, market, odds, STAKE_UGX, DRY_RUN)
                         bets_this_round += 1
                         if not DRY_RUN:
-                            ok = await place_htft_bet(
-                                page, home, away, market, odds, STAKE_UGX
-                            )
+                            ok = await place_htft_bet(page, home, away, market, odds, STAKE_UGX)
                             if ok: bets_placed += 1
                         await asyncio.sleep(random.uniform(1.0, 2.0))
 
-                log.info(
-                    f"Round {round_id} done: {bets_this_round} signals | "
-                    f"placed={bets_placed} total"
-                )
+                log.info(f"Round done: {bets_this_round} signals | placed={bets_placed}")
 
             except Exception as e:
                 log.error(f"Loop error: {e}")
+                import traceback; log.error(traceback.format_exc())
 
-            # Wait for next round
-            log.info("Waiting 3 min for next round...")
+            log.info("Waiting 3 min...")
             await asyncio.sleep(180)
 
         await browser.close()
