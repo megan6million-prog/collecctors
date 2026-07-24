@@ -336,34 +336,33 @@ def bk_save(records):
 
 def bk_collect():
     seen=set(); odds_cache={}; saved=0
+    # odds_cache keyed by season_id (str) → {event_id: {home,away,markets}}
+    cached_seasons = set()
     print("[betkraft] Collector started", flush=True)
-
-    # Track which round_number_id we've cached odds for
-    cached_rn_ids = set()
 
     while True:
         try:
-            # 1. Grab odds for upcoming period (before it starts)
+            # 1. Cache odds for upcoming periods (keyed by season_id)
             pdata = fetch(BK_PERIODS, BK_H)
             if pdata:
                 periods = pdata.get('data',{}).get('periods',[])
-                # Only cache latest 2 upcoming periods
                 for period in periods[-2:]:
-                    rn_id = period.get('round_number_id')
-                    if rn_id and rn_id not in cached_rn_ids:
-                        print(f"[betkraft/odds] Fetching odds for rn={rn_id}...", flush=True)
+                    rn_id  = period.get('round_number_id')
+                    sid    = str(period.get('season_id',''))
+                    if rn_id and sid and sid not in cached_seasons:
+                        print(f"[betkraft/odds] Fetching odds rn={rn_id} season={sid}...", flush=True)
                         match_odds = bk_fetch_round_odds(rn_id)
                         if match_odds:
-                            odds_cache[rn_id] = match_odds
-                            cached_rn_ids.add(rn_id)
-                            print(f"[betkraft/odds] Cached {len(match_odds)} matches for rn={rn_id}", flush=True)
-                        # Trim cache — keep only last 10
-                        if len(cached_rn_ids) > 10:
-                            oldest = sorted(cached_rn_ids)[0]
-                            cached_rn_ids.discard(oldest)
+                            odds_cache[sid] = match_odds
+                            cached_seasons.add(sid)
+                            print(f"[betkraft/odds] Cached {len(match_odds)} matches for season={sid}", flush=True)
+                        # Trim — keep last 10 seasons
+                        if len(cached_seasons) > 10:
+                            oldest = sorted(cached_seasons)[0]
+                            cached_seasons.discard(oldest)
                             odds_cache.pop(oldest, None)
 
-            # 2. Fetch results
+            # 2. Fetch results — look up odds via season_id
             rdata = fetch(BK_RESULTS, BK_H)
             if not rdata: time.sleep(10); continue
 
@@ -371,10 +370,9 @@ def bk_collect():
             records=[]
             for rnd in rounds:
                 round_id = str(rnd.get('round_id',''))
-                rn_id    = rnd.get('round_number_id')
+                sid      = str(rnd.get('season_id',''))
                 if not round_id: continue
-                # Try to find matching odds cache
-                cached = odds_cache.get(rn_id, {})
+                cached = odds_cache.get(sid, {})
 
                 for i,m in enumerate(rnd.get('matches',[])):
                     home=(m.get('home') or '').strip()
@@ -387,14 +385,12 @@ def bk_collect():
                     seen.add(key)
 
                     hth,hta=bk_parse_score(m.get('half_time_scores',''))
-                    # Find odds by team name in cache
                     match_odd = next((v for v in cached.values()
                                       if v.get('home')==home and v.get('away')==away), {})
                     mkts_dict = match_odd.get('markets',{})
                     x12  = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('1X2',{}).get('outcomes',[])} if '1X2' in mkts_dict else {}
                     ou25 = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('TG25',{}).get('outcomes',[])} if 'TG25' in mkts_dict else {}
                     btts = {o['outcome_id']:float(o['odd_value']) for o in mkts_dict.get('GG',{}).get('outcomes',[])} if 'GG' in mkts_dict else {}
-                    # Store all markets as JSON
                     all_mkts = [{'id':k,'outcomes':v.get('outcomes',[])} for k,v in mkts_dict.items()]
 
                     has_odds='✓' if x12 else '✗'
