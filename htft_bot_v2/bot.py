@@ -434,6 +434,22 @@ HTFT_MATRIX = {
     "WOL v WHU": [("2/1",19.5,0.2857,4.5714), ("1/X",22.5,0.1429,2.2143), ("X/2",8.75,0.2857,1.5)],
 }
 
+import base64
+
+def log_screenshot(page_obj, label):
+    """Fire-and-forget: save screenshot and print as base64 to logs."""
+    async def _do():
+        try:
+            path = f'/tmp/{label}.png'
+            await page_obj.screenshot(path=path)
+            with open(path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode()
+            # Print first 200 chars of b64 as marker — paste full output to decode
+            log.info(f"[SCREENSHOT:{label}] {b64[:200]}...TRUNCATED({len(b64)}chars)")
+        except Exception as e:
+            log.warning(f"Screenshot failed: {e}")
+    return _do()
+
 # ── Browser helpers ────────────────────────────────────────────────────
 async def login(page):
     await page.goto('https://www.betpawa.ug', timeout=30000)
@@ -475,7 +491,7 @@ async def place_bet(page, home, away, market, stake):
         else:
             body = await page.inner_text('body')
             log.warning(f"Match not found: '{home} - {away}' | body[300:500]: {body[300:500]}")
-            await page.screenshot(path='/tmp/no_match.png')
+            await log_screenshot(page, 'no_match')
             return False
 
         # Click HTFT tab
@@ -487,7 +503,7 @@ async def place_bet(page, home, away, market, stake):
                 log.info(f"Tab: {tab}")
                 break
         else:
-            await page.screenshot(path='/tmp/no_htft_tab.png')
+            await log_screenshot(page, 'no_htft_tab')
             body = await page.inner_text('body')
             log.warning(f"No HTFT tab. Visible: {body[100:300]}")
             return False
@@ -495,7 +511,7 @@ async def place_bet(page, home, away, market, stake):
         # Click outcome
         outcome = page.get_by_text(market, exact=True).first
         if not await outcome.count():
-            await page.screenshot(path='/tmp/no_outcome.png')
+            await log_screenshot(page, 'no_outcome')
             log.warning(f"Outcome '{market}' not found")
             return False
         await outcome.click()
@@ -514,16 +530,16 @@ async def place_bet(page, home, away, market, stake):
             if await btn.count():
                 await btn.click()
                 await asyncio.sleep(4)
-                await page.screenshot(path='/tmp/bet_placed.png')
+                await log_screenshot(page, 'bet_placed')
                 log.info(f"✓ {home} v {away} | {market} | {stake} UGX")
                 return True
 
-        await page.screenshot(path='/tmp/no_place_btn.png')
+        await log_screenshot(page, 'no_place_btn')
         log.warning("Place Bet button not found")
         return False
     except Exception as e:
         log.error(f"Error: {e}")
-        await page.screenshot(path='/tmp/error.png')
+        await log_screenshot(page, 'error')
         return False
 
 # ── Main ───────────────────────────────────────────────────────────────
