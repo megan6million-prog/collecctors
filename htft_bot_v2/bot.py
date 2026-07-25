@@ -472,71 +472,57 @@ async def login(page):
 
 async def place_bet(page, home, away, market, stake):
     try:
-        # Navigate to match page directly
         await page.goto('https://www.betpawa.ug/virtual-sports?virtualTab=upcoming&leagueId=7794',
                         timeout=30000)
         await asyncio.sleep(7)
 
-        # Take screenshot for debugging
-        await page.screenshot(path=f'/tmp/page_{home}_{away}.png')
-
-        # Try to find match text
-        for txt in [f'{home} - {away}', home]:
-            el = page.get_by_text(txt, exact=False).first
-            if await el.count():
-                await el.click()
-                await asyncio.sleep(3)
-                log.info(f"Opened: {home} v {away}")
-                break
-        else:
+        # Click match — format confirmed as "HOME - AWAY"
+        match_text = f'{home} - {away}'
+        match_el = page.get_by_text(match_text, exact=False).first
+        if not await match_el.count():
             body = await page.inner_text('body')
-            log.warning(f"Match not found: '{home} - {away}' | body[300:500]: {body[300:500]}")
-            await log_screenshot(page, 'no_match')
+            log.warning(f"Match not found: '{match_text}' | page: {body[200:400]}")
+            await log_screenshot(page, f'no_match_{home}_{away}')
             return False
+        await match_el.click()
+        await asyncio.sleep(4)
 
-        # Click HTFT tab
-        for tab in ['HT/FT', 'HTFT', 'Half Time/Full Time']:
-            t = page.get_by_text(tab, exact=False).first
-            if await t.count():
-                await t.click()
-                await asyncio.sleep(2)
-                log.info(f"Tab: {tab}")
-                break
-        else:
-            await log_screenshot(page, 'no_htft_tab')
+        # All HTFT outcomes are directly visible after clicking match — NO tab click needed
+        # Confirmed from local testing: 1/1, 1/X, 1/2, X/1, X/X, X/2, 2/1, 2/X, 2/2 all visible
+        outcome_el = page.get_by_text(market, exact=True).first
+        if not await outcome_el.count():
             body = await page.inner_text('body')
-            log.warning(f"No HTFT tab. Visible: {body[100:300]}")
+            log.warning(f"Outcome '{market}' not found | page: {body[200:400]}")
+            await log_screenshot(page, f'no_outcome_{market}')
             return False
-
-        # Click outcome
-        outcome = page.get_by_text(market, exact=True).first
-        if not await outcome.count():
-            await log_screenshot(page, 'no_outcome')
-            log.warning(f"Outcome '{market}' not found")
-            return False
-        await outcome.click()
-        await asyncio.sleep(1)
+        await outcome_el.click()
+        await asyncio.sleep(2)
 
         # Set stake
-        inp = page.locator('input[placeholder*="stake" i], input[placeholder*="amount" i]').first
+        inp = page.locator('input[placeholder*="stake" i]').first
         if await inp.count():
-            await inp.triple_click()
-            await inp.type(str(stake))
+            await inp.click()
+            await page.keyboard.press('Control+A')
+            await page.keyboard.type(str(stake))
             await asyncio.sleep(0.5)
 
-        # Place bet
-        for btn_txt in ['Place Bet', 'Place bet', 'Confirm']:
-            btn = page.get_by_role('button', name=btn_txt).first
+        # Check available buttons
+        btns = await page.locator('button').all_inner_texts()
+        log.info(f"Buttons: {[b.strip() for b in btns if b.strip()][:8]}")
+
+        for btn_txt in ['Place Bet', 'Place bet', 'Confirm', 'BET', 'Bet']:
+            btn = page.get_by_role('button', name=btn_txt)
             if await btn.count():
                 await btn.click()
                 await asyncio.sleep(4)
-                await log_screenshot(page, 'bet_placed')
+                await log_screenshot(page, f'placed_{home}_{away}_{market}')
                 log.info(f"✓ {home} v {away} | {market} | {stake} UGX")
                 return True
 
         await log_screenshot(page, 'no_place_btn')
-        log.warning("Place Bet button not found")
+        log.warning(f"No place bet button. All buttons: {btns}")
         return False
+
     except Exception as e:
         log.error(f"Error: {e}")
         await log_screenshot(page, 'error')
