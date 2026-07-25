@@ -196,9 +196,9 @@ def bp_get_active_rounds(seasons):
                     recent_done.append((end, rnd['id']))  # finished
             except Exception:
                 pass
-    # Only keep last 5 completed rounds (avoid re-scanning old history)
+    # Keep last 20 completed rounds (catch up on missed ones)
     recent_done.sort(key=lambda x: x[0], reverse=True)
-    return active, [r for _,r in recent_done[:5]]
+    return active, [r for _,r in recent_done[:20]]
 
 def bp_collect():
     seen=set(); mkt_cache={}; saved=0
@@ -218,7 +218,7 @@ def bp_collect():
             for round_id in rounds_to_fetch:
                 ed = fetch(BP_EVENTS.format(round_id=round_id), BP_H)
                 if not ed: continue
-                time.sleep(0.5)  # gentle between round fetches
+                time.sleep(0.3)  # gentle between round fetches
 
                 records=[]
                 for e in ed.get('responses',[]):
@@ -230,11 +230,12 @@ def bp_collect():
                     lname=BP_LEAGUES.get(lid,comp.get('name',''))
                     if not lname: continue
 
-                    # Cache odds if in active window
-                    if round_id in active_rounds:
-                        mkts=bp_markets(e)
-                        if mkts['1x2'] or mkts['htft']:
-                            mkt_cache[eid]=mkts
+                    # Cache odds from ANY round that has them (active or upcoming)
+                    mkts=bp_markets(e)
+                    if mkts['1x2'] or mkts['htft']:
+                        mkt_cache[eid]=mkts
+                        if round_id in active_rounds:
+                            print(f"[betpawa/odds] cached eid={eid} 1x2={list(mkts['1x2'].keys())[:3]}", flush=True)
 
                     key=(round_id,lid,home,away)
                     if key in seen: continue
@@ -270,13 +271,20 @@ def bp_collect():
                     print(f"[betpawa] [{lname}] {home} v {away} HT={hth}:{hta} FT={fth}:{fta} HTFT={outcome} odds={has_odds}", flush=True)
 
                 if records:
+                    # Round-level quality gate: avg FT TG must be > 2.0
+                    avg_tg = sum(r[5]+r[6] for r in records) / len(records)
+                    if avg_tg < 2.0:
+                        print(f"[betpawa] SKIP round {round_id} — avg_tg={avg_tg:.2f} (rate-limited)", flush=True)
+                        # Remove from seen so we retry
+                        for r in records: seen.discard((r[0],r[2],r[3],r[4]))
+                        continue
                     bp_save(records); saved+=len(records)
-                    print(f"[betpawa] +{len(records)} saved (total {saved})", flush=True)
+                    print(f"[betpawa] +{len(records)} saved avg_tg={avg_tg:.2f} (total {saved})", flush=True)
 
         except Exception as e:
             print(f"[betpawa] Error: {e}", flush=True)
 
-        time.sleep(8)  # wait 8s before next full cycle (~12 req/min max)
+        time.sleep(3)  # 3s cycle — ~25 rounds/hr coverage
 
 
 # ══════════════════════════════════════════════════════════════════════
