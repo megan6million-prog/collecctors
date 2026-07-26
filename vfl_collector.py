@@ -204,15 +204,17 @@ def bp_collect():
                     t     = rnd.get('tradingTime',{})
                     start = datetime.fromisoformat(t['start'].replace('Z','+00:00'))
                     end   = datetime.fromisoformat(t['end'].replace('Z','+00:00'))
-                    # Accept rounds that are upcoming or just started
-                    if end < now and (now-end).total_seconds() > 300: continue
-                    if best is None or start < best[1]:
-                        best = (rid, start, end)
+                    # Accept rounds upcoming or recently finished (within 10 min)
+                    if end < now and (now-end).total_seconds() > 600: continue
+                    # Pick the round whose start is closest to now
+                    dist = abs((start - now).total_seconds())
+                    if best is None or dist < best[3]:
+                        best = (rid, start, end, dist)
 
             if not best:
                 time.sleep(5); continue
 
-            rid, start, end = best
+            rid, start, end, _ = best
 
             # Wait for trading window
             if start > now:
