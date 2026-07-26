@@ -9,7 +9,7 @@ from playwright.async_api import async_playwright
 
 # ── Env config ────────────────────────────────────────────────────────
 PHONE     = os.environ.get('BP_PHONE', '0705949189')
-PIN       = os.environ.get('BP_PIN',   '4413')
+PIN       = os.environ.get('BP_PIN',   'password')
 STAKE     = int(os.environ.get('STAKE_UGX', '1'))
 DRY_RUN   = os.environ.get('DRY_RUN', 'true').lower() == 'true'
 

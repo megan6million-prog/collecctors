@@ -101,7 +101,7 @@ CREDENTIALS = {
     },
     "betpawa": {
         "phone": os.getenv("BP_PHONE", "0705949189"),
-        "pin": os.getenv("BP_PIN", "4413"),
+        "pin": os.getenv("BP_PIN", "password"),
         "login_url": "https://www.betpawa.ug/login",
     },
     "bangbet": {
