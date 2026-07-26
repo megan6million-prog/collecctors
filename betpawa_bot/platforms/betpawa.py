@@ -110,12 +110,20 @@ async def _scrape_current_tab():
 
 
 async def _click_tab(name):
-    """Click a market tab (1X2 / O/U / BTTS / DC / HT/FT) by its text."""
+    """Click a market tab by its text. Tries exact then partial match."""
     js = """() => {
-        const want = %s;
+        const want = %s.toUpperCase();
         const tabs = [...document.querySelectorAll('[class*=_tab_ i], [role=tab], button, a')];
+        // Try exact match first
         for (const t of tabs) {
-            if ((t.textContent || '').trim().toUpperCase() === want.toUpperCase() && t.offsetHeight > 0) {
+            if ((t.textContent || '').trim().toUpperCase() === want && t.offsetHeight > 0) {
+                t.click(); return true;
+            }
+        }
+        // Try partial match
+        for (const t of tabs) {
+            const txt = (t.textContent || '').trim().toUpperCase();
+            if ((txt.includes(want) || want.includes(txt)) && txt.length > 0 && t.offsetHeight > 0) {
                 t.click(); return true;
             }
         }

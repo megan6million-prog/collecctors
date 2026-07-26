@@ -295,14 +295,19 @@ async def place_slip_live(slip, stake):
     from browser_harness import wait
 
     if BRAIN_MODE == "htft":
-        # Each slip is a single HTFT bet: [signal]
-        # Place each bet independently (no accumulator)
-        s = slip[0]
+        s     = slip[0]
         home  = s['home']
         away  = s['away']
-        pick  = s['pick']   # e.g. '1/2', '2/X', 'X/1' etc.
+        pick  = s['pick']
         await navigate_to_virtuals()
-        await _click_tab("HTFT")
+        # Tab label on betpawa is "HT/FT" — try both variants
+        clicked_tab = False
+        for tab_name in ["HT/FT", "HTFT", "Half Time/Full Time"]:
+            if await _click_tab(tab_name):
+                clicked_tab = True
+                break
+        if not clicked_tab:
+            log.warning("HTFT tab not found, proceeding anyway (may already be visible)")
         await wait(1.5)
         clicked = await click_match_odd(home, 'HTFT', pick)
         if not clicked:
