@@ -158,17 +158,17 @@ def bp_markets(e):
         name=mk.get('marketType',{}).get('name','')
         rows=mk.get('row',[])
         if name=='1X2 - FT' and rows:
-            for p in rows[0].get('prices',[]): m['1x2'][p['name']]=float(p['price'])
+            for p in rows[0].get('prices',[]): m['1x2'][p['name']]=float(p['odds'])
         elif name=='Both Teams To Score - FT' and rows:
-            for p in rows[0].get('prices',[]): m['btts'][p['name'].lower()]=float(p['price'])
+            for p in rows[0].get('prices',[]): m['btts'][p['name'].lower()]=float(p['odds'])
         elif name=='Total Score Over/Under - FT':
             for row in rows:
                 line={}
-                for p in row.get('prices',[]): line[p['name'].lower()]=float(p['price'])
+                for p in row.get('prices',[]): line[p['name'].lower()]=float(p['odds'])
                 m['ou'].append(line)
         elif name=='HT / FT':
             for row in rows:
-                for p in row.get('prices',[]): m['htft'][p['name']]=float(p['price'])
+                for p in row.get('prices',[]): m['htft'][p['name']]=float(p['odds'])
     return m
 
 def bp_save(records):
