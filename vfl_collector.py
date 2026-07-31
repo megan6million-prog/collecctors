@@ -196,6 +196,15 @@ def bp_collect():
             if not data: time.sleep(5); continue
 
             now  = datetime.now(timezone.utc)
+
+            # Collect ALL round IDs in current seasons
+            current_rids = set()
+            for s in data.get('items',[]):
+                for rnd in s.get('rounds',[]):
+                    current_rids.add(rnd['id'])
+            # Prune seen: remove rounds no longer in API response
+            seen &= current_rids
+
             best = None
             for s in data.get('items',[]):
                 for rnd in s.get('rounds',[]):
@@ -204,9 +213,8 @@ def bp_collect():
                     t     = rnd.get('tradingTime',{})
                     start = datetime.fromisoformat(t['start'].replace('Z','+00:00'))
                     end   = datetime.fromisoformat(t['end'].replace('Z','+00:00'))
-                    # Accept rounds upcoming or recently finished (within 10 min)
-                    if end < now and (now-end).total_seconds() > 600: continue
-                    # Pick the round whose start is closest to now
+                    # Accept: upcoming, currently active, or recently finished (30 min)
+                    if end < now and (now-end).total_seconds() > 1800: continue
                     dist = abs((start - now).total_seconds())
                     if best is None or dist < best[3]:
                         best = (rid, start, end, dist)
